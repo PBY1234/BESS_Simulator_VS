@@ -1,0 +1,12 @@
+{
+  "name": "omie-parser",
+  "version": "1.0.0",
+  "description": "Parse OMIE data to JSON",
+  "main": "parse.js",
+  "scripts": {
+    "start": "node parse.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
