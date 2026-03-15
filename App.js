@@ -162,62 +162,150 @@ function optimiseSlot(stack,bessMW,rt){
   return{basePrice:br.clearPrice,dischargePrice:bdP,chargePrice:bcP,marketMW:stack.supply.at(-1).cumMW};
 }
 
-/* ═══════════════ PROXY MODEL ═══════════════ */
-// Non-linear merit order based on OMIE 2025 thermal gap analysis
-// Residual load p50 by hour (GW)
+/* ═══════════════ PROXY MODEL v2 — Quantity-based ═══════════════ */
+// Core insight: BESS affects MW quantity, quantity determines marginal plant, plant determines price.
+// Instead of price = f(bess), we model: newMW = clearingMW ± bessMW → price = supplyCurve(newMW)
+//
+// We build a synthetic supply curve per hour from:
+// 1. Renewable + nuclear base (flat, ~EUR 0-5)
+// 2. Hydro/imports (gentle slope, EUR 5-30)
+// 3. CCGT gas (steep, EUR 35-80)
+// 4. Peakers/oil (very steep, EUR 80-180)
+// 5. Interconnectors (France/Portugal price coupling, ~3 GW cap)
+//
+// Then we walk the curve to find the new clearing price after shifting by bessMW.
+
+// Residual load p50 by hour (GW) — from 2025 OMIE data
 const THERMAL_GAP = {
   1:11.7,2:10.3,3:9.7,4:9.3,5:9.3,6:9.9,7:11.6,8:13.9,9:12.9,10:8.1,
   11:4.9,12:2.4,13:1.3,14:1.7,15:1.4,16:1.3,17:3.4,18:4.5,
   19:7.8,20:12.2,21:16.5,22:17.8,23:16.0,24:13.4
 };
 
-function proxyPrice(spotPrice, bessMW, action, hora) {
+// Build a synthetic supply curve for a given hour
+// Returns array of {mw (cumulative GW), price (EUR/MWh)} points
+function buildProxyCurve(hora, spotPrice) {
   const tgGW = THERMAL_GAP[hora] || 10;
   const damGW = tgGW * 0.56; // 44% bilateral
+  const pts = [];
+
+  // Solar profile (GW)
+  const solGW = (hora >= 7 && hora <= 20)
+    ? 18 * Math.exp(-0.5 * Math.pow((hora - 13.5) / 4, 2)) : 0;
+  const winGW = 8 + 2 * Math.sin((hora - 6) * Math.PI / 12);
+  const nucGW = 7.1;
+
+  // 1. Nuclear: ~7 GW at EUR 0-3
+  for (let gw = 0; gw <= nucGW; gw += 0.5) pts.push({ gw, price: 0.5 + gw * 0.3 });
+
+  // 2. Renewables: solar+wind at EUR -5 to 5 (can go negative)
+  const reBase = nucGW;
+  const reGW = solGW + winGW;
+  for (let dg = 0; dg <= reGW; dg += 0.5) {
+    pts.push({ gw: reBase + dg, price: -2 + dg * 0.3 / Math.max(reGW, 1) });
+  }
+
+  // 3. Interconnectors: ~3 GW at EUR 10-45 (French/Portuguese marginal)
+  const icBase = reBase + reGW;
+  const icGW = 3;
+  for (let dg = 0; dg <= icGW; dg += 0.3) {
+    pts.push({ gw: icBase + dg, price: 10 + dg * 12 });
+  }
+
+  // 4. Hydro: ~2 GW at EUR 20-40
+  const hyBase = icBase + icGW;
+  const hyGW = 2;
+  for (let dg = 0; dg <= hyGW; dg += 0.3) {
+    pts.push({ gw: hyBase + dg, price: 20 + dg * 10 });
+  }
+
+  // 5. CCGT gas: steep section — EUR 40 to spotPrice+20
+  const gasBase = hyBase + hyGW;
+  const gasGW = Math.max(damGW - icGW - hyGW, 1);
+  for (let dg = 0; dg <= gasGW; dg += 0.2) {
+    const frac = dg / gasGW;
+    // Quadratic: steeper as we approach the top
+    pts.push({ gw: gasBase + dg, price: 40 + frac * frac * (Math.max(spotPrice * 1.2, 70) - 40) });
+  }
+
+  // 6. Peakers/oil: very steep — EUR spotPrice to 180+
+  const pkBase = gasBase + gasGW;
+  const pkGW = 2;
+  for (let dg = 0; dg <= pkGW; dg += 0.2) {
+    pts.push({ gw: pkBase + dg, price: Math.max(spotPrice, 60) + dg * 40 });
+  }
+
+  return pts;
+}
+
+// Walk the supply curve to find price at a given cumulative GW
+function priceAtGW(curve, targetGW) {
+  if (targetGW <= curve[0].gw) return curve[0].price;
+  if (targetGW >= curve.at(-1).gw) return curve.at(-1).price;
+  for (let i = 1; i < curve.length; i++) {
+    if (curve[i].gw >= targetGW) {
+      // Linear interpolation between points
+      const prev = curve[i - 1], curr = curve[i];
+      const frac = (targetGW - prev.gw) / (curr.gw - prev.gw);
+      return prev.price + frac * (curr.price - prev.price);
+    }
+  }
+  return curve.at(-1).price;
+}
+
+// Find approximate clearing GW (where price matches spot)
+function findClearingGW(curve, spotPrice) {
+  for (let i = 1; i < curve.length; i++) {
+    if (curve[i].price >= spotPrice) {
+      const prev = curve[i - 1], curr = curve[i];
+      if (curr.price === prev.price) return curr.gw;
+      const frac = (spotPrice - prev.price) / (curr.price - prev.price);
+      return prev.gw + frac * (curr.gw - prev.gw);
+    }
+  }
+  return curve.at(-1).gw;
+}
+
+function proxyPrice(spotPrice, bessMW, action, hora, solarScale = 1.0) {
+  const curve = buildProxyCurve(hora, spotPrice, solarScale);
   const bessGW = bessMW / 1000;
+  const clearGW = findClearingGW(curve, spotPrice);
 
   if (action === "discharge") {
-    // BESS adds supply → walks DOWN the steep gas/peaker merit order
-    const frac = Math.min(bessGW / Math.max(damGW, 0.3), 1.0);
-    const steep = spotPrice > 60 ? 0.55 : spotPrice > 30 ? 0.65 : 0.8;
-    const reduction = Math.pow(frac, steep);
-    const floor = spotPrice * (1 - frac) * 0.3;
-    return Math.max(0, spotPrice * (1 - reduction) + floor * reduction);
+    const newClearGW = Math.max(0, clearGW - bessGW);
+    return Math.max(0, priceAtGW(curve, newClearGW));
   } else {
-    // BESS adds demand → walks UP the supply curve from current clearing point
-    // Key insight: the supply curve is FLAT in the renewable zone (EUR 0-5 for ~15-20 GW)
-    // and only gets steep in the gas zone.
-    //
-    // If current price is low (solar hours), we're in the flat zone:
-    //   adding 10 GW of demand still stays in the flat renewable zone → minimal price lift
-    // If current price is high (evening), we're already in the steep zone:
-    //   adding demand walks further up → bigger lift, but capped by available capacity
-    //
-    // Model: estimate where on the supply curve we are, then walk up by bessGW
-
-    // Approximate renewable capacity available at this hour (GW above clearing)
-    const totalAvailGW = 25 + (hora >= 10 && hora <= 16 ? 15 : 5); // solar adds ~15 GW midday
-    const headroomGW = Math.max(totalAvailGW - (tgGW + 7), 0); // GW of cheap supply above clearing
-
-    if (bessGW <= headroomGW) {
-      // Still in the flat renewable zone → very small price increase
-      // Slope in flat zone: ~EUR 0.5-2 per GW
-      const flatSlope = spotPrice < 10 ? 0.3 : 0.8; // EUR/GW
-      return spotPrice + bessGW * flatSlope;
-    } else {
-      // Exceed the flat zone, enter the steeper part
-      const flatPart = headroomGW * 0.5; // cost of the flat portion
-      const steepGW = bessGW - headroomGW;
-      const steepFrac = steepGW / Math.max(damGW, 2);
-      // In the steep zone, each GW adds ~EUR 3-8 depending on how deep we go
-      const steepSlope = 3 + steepFrac * 10;
-      return spotPrice + flatPart + steepGW * steepSlope;
-    }
+    const newClearGW = clearGW + bessGW;
+    return Math.max(0, priceAtGW(curve, newClearGW));
   }
 }
 
+// Integrated revenue: instead of MW * clearingPrice, integrate the area
+// under the supply curve from (clearGW - bessGW) to clearGW for discharge.
+// This captures that the first MW earns more than the last MW.
+function integratedRevenue(spotPrice, bessMW, hora, solarScale = 1.0) {
+  const curve = buildProxyCurve(hora, spotPrice, solarScale);
+  const bessGW = bessMW / 1000;
+  const clearGW = findClearingGW(curve, spotPrice);
+  const newClearGW = Math.max(0, clearGW - bessGW);
+
+  // The BESS displaces generation from newClearGW to clearGW
+  // Revenue = integral of (spotPrice - supplyCurve(gw)) over that range
+  // Simplified: average price across the displaced band × MW
+  const steps = 20;
+  const stepGW = (clearGW - newClearGW) / steps;
+  let totalRev = 0;
+  for (let i = 0; i < steps; i++) {
+    const gw = newClearGW + (i + 0.5) * stepGW;
+    const p = priceAtGW(curve, gw);
+    // Revenue per step = stepGW * 1000 MW * p EUR/MWh * 1h
+    totalRev += stepGW * 1000 * p;
+  }
+  return totalRev; // EUR for 1 hour of discharge
+}
+
 /* ═══════════════ SCORE ALL HOURS ═══════════════ */
-function scoreAllHours(dailySlots, curveStacks, rt, bessMW) {
+function scoreAllHours(dailySlots, curveStacks, rt, bessMW, solarScale = 1.0) {
   const scores = {};
   for (const date of Object.keys(dailySlots)) {
     const slots = dailySlots[date];
@@ -233,8 +321,8 @@ function scoreAllHours(dailySlots, curveStacks, rt, bessMW) {
       }
       if (!scores[key]) {
         scores[key] = { date, hora: s.hora, spot: s.price, hasCurve: !!stack,
-          disP: proxyPrice(s.price, bessMW, "discharge", s.hora),
-          chgP: proxyPrice(s.price, bessMW, "charge", s.hora),
+          disP: proxyPrice(s.price, bessMW, "discharge", s.hora, solarScale),
+          chgP: proxyPrice(s.price, bessMW, "charge", s.hora, solarScale),
           mktMW: null };
       }
     }
@@ -274,34 +362,33 @@ function simulateDay(date, slots, scores, bessMW, bessH, rt, cyclesDay) {
   }
   pairs.sort((a, b) => b.margin - a.margin);
 
-  const chgSet = new Set(), disSet = new Set();
+  const chgSet = new Set(), disSet = new Set(), usedHours = new Set();
   let nPairs = 0;
   for (const p of pairs) {
     if (nPairs >= maxDisHours) break;
-    if (chgSet.has(p.ch.hora) || disSet.has(p.ch.hora)) continue;
-    if (chgSet.has(p.di.hora) || disSet.has(p.di.hora)) continue;
+    if (usedHours.has(p.ch.hora) || usedHours.has(p.di.hora)) continue;
     chgSet.add(p.ch.hora);
     disSet.add(p.di.hora);
+    usedHours.add(p.ch.hora);
+    usedHours.add(p.di.hora);
     nPairs++;
   }
 
-  // If no profitable pairs found, still dispatch greedily:
-  // charge at cheapest hours, discharge at most expensive, even if margin is thin
+  // Fallback: if no profitable pairs, still dispatch greedily
   if (nPairs === 0 && hourData.length >= 2) {
     const chgR2 = hourData.slice().sort((a, b) => a.sc.chgP - b.sc.chgP);
     const disR2 = hourData.slice().sort((a, b) => b.sc.disP - a.sc.disP);
     let nc = 0, nd2 = 0;
     for (const c of chgR2) {
       if (nc >= maxChgHours) break;
-      if (disSet.has(c.hora)) continue;
-      chgSet.add(c.hora); nc++;
+      if (usedHours.has(c.hora)) continue;
+      chgSet.add(c.hora); usedHours.add(c.hora); nc++;
     }
     for (const d of disR2) {
       if (nd2 >= maxDisHours) break;
-      if (chgSet.has(d.hora)) continue;
-      // Only discharge if it comes after at least one charge hour
+      if (usedHours.has(d.hora)) continue;
       if ([...chgSet].some(ch => ch < d.hora)) {
-        disSet.add(d.hora); nd2++;
+        disSet.add(d.hora); usedHours.add(d.hora); nd2++;
       }
     }
   }
@@ -330,40 +417,21 @@ function simulateDay(date, slots, scores, bessMW, bessH, rt, cyclesDay) {
     }
     trace.push({ hora: h.hora, spot: +h.spot.toFixed(2), adj: +adj.toFixed(2),
       mw: +mw.toFixed(0), mktMW: h.sc.mktMW, act, curve: h.sc.hasCurve,
-      soc: +Math.max(0, soc).toFixed(2), rev: +rev.toFixed(2) });
+      soc: Math.round(100 * soc / MWh) });
   }
-  return { trace, totalRev: rev, curves };
-}
 
-/* ═══════════════ LOAD PRELOADED DATA ═══════════════ */
-// Converts the omie_data.json structure into the app's internal formats
-function ingestPreloadedData(data, solveIntersectionFn) {
-  // Prices → priceSlots
-  const slots = [];
-  for (const [date, hours] of Object.entries(data.prices || {})) {
-    for (const [hora, price] of Object.entries(hours)) {
-      slots.push({ date, hora: parseInt(hora), price: +price });
-    }
-  }
-  slots.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.hora - b.hora);
+  // For spread: use the discharge price at the peak spot hour and
+  // charge price at the trough spot hour — these represent the
+  // counterfactual market clearing prices with this BESS fleet
+  const peakHour = hourData.reduce((best, h) => h.spot > best.spot ? h : best, hourData[0]);
+  const troughHour = hourData.reduce((best, h) => h.spot < best.spot ? h : best, hourData[0]);
+  const aMax = peakHour.sc.disP;  // what peak price becomes after BESS discharge
+  const aMin = troughHour.sc.chgP; // what trough price becomes after BESS charge
 
-  // Curves → curveStacks
-  let stacks = null;
-  const curveKeys = Object.keys(data.curves || {});
-  if (curveKeys.length > 0) {
-    stacks = {};
-    for (const [date, hours] of Object.entries(data.curves)) {
-      stacks[date] = {};
-      for (const [hora, cd] of Object.entries(hours)) {
-        const sup = (cd.s || []).map(([price, cumMW]) => ({ price: +price, cumMW: +cumMW }));
-        const dem = (cd.d || []).map(([price, cumMW]) => ({ price: +price, cumMW: +cumMW }));
-        if (sup.length < 2 || dem.length < 2) continue;
-        const inter = solveIntersectionFn(sup, dem);
-        stacks[date][parseInt(hora)] = { supply: sup, demand: dem, hora: parseInt(hora), ...inter };
-      }
-    }
-  }
-  return { slots, stacks };
+  return { date, bMax, bMin, aMax, aMin,
+    bSpread: bMax - bMin, aSpread: Math.max(aMax - aMin, 0),
+    rev, curvePct: Math.round(100 * curves / Math.max(hourData.length, 1)),
+    trace, endSoc: soc };
 }
 
 /* ═══════════════ UI COMPONENTS ═══════════════ */
@@ -382,6 +450,33 @@ function Slider({ label, value, min, max, step, unit, onChange }) {
 
 const AC = { charge: "#10b981", discharge: "#ef4444", idle: "#e2e8f0" };
 
+// IRR calculator using Newton-Raphson
+function calcIRR(cashflows, guess = 0.1) {
+  let rate = guess;
+  for (let i = 0; i < 100; i++) {
+    let npv = 0, dnpv = 0;
+    for (let t = 0; t < cashflows.length; t++) {
+      const d = Math.pow(1 + rate, t);
+      npv += cashflows[t] / d;
+      dnpv -= t * cashflows[t] / (d * (1 + rate));
+    }
+    if (Math.abs(dnpv) < 1e-12) break;
+    const newRate = rate - npv / dnpv;
+    if (Math.abs(newRate - rate) < 1e-6) return newRate;
+    rate = newRate;
+    if (!isFinite(rate) || rate < -0.99) return NaN;
+  }
+  return rate;
+}
+
+// Ancillary revenue cannibalisation: €/kW declines as fleet grows
+// Based on: 1 GW → ~60, 3 GW → ~45, 5 GW → ~30, 10 GW → ~15
+function ancillaryPerKW(baseRate, gwFleet) {
+  if (gwFleet <= 0) return baseRate;
+  // Exponential decay: rate = base * exp(-0.15 * gw)
+  return baseRate * Math.exp(-0.15 * gwFleet);
+}
+
 /* ═══════════════ MAIN APP ═══════════════ */
 export default function App() {
   const [tab, setTab] = useState("upload");
@@ -395,42 +490,17 @@ export default function App() {
   const [cycD, setCycD] = useState(2);
   const [capex, setCapex] = useState(250);
   const [opex, setOpex] = useState(8);
+  const [solScale, setSolScale] = useState(1.0);
+  const [ancillaryBase, setAncillaryBase] = useState(45); // €/kW/year at 1 GW
+  const [capacityPrice, setCapacityPrice] = useState(25); // €/kW/year
+  const [life, setLife] = useState(15);
+  const [ancillaryCannibal, setAncillaryCannibal] = useState(true); // enable cannibalisation
   const [simRes, setSimRes] = useState(null);
   const [running, setRunning] = useState(false);
   const [runSt, setRunSt] = useState("");
   const [stripSc, setStripSc] = useState("1 GW");
   const [curveHour, setCurveHour] = useState(21);
   const [curveSc, setCurveSc] = useState("5 GW");
-  const [preloadStatus, setPreloadStatus] = useState("loading");
-
-  // ── Auto-load reference year on startup ──────────────────────────────────
-  useEffect(() => {
-    // Try .gz first, fall back to .json
-    const tryLoad = (url) =>
-      fetch(url).then(r => {
-        if (!r.ok) throw new Error(r.status);
-        return r.json(); // browser auto-decompresses gzip if served with correct headers
-      });
-
-    tryLoad("https://bess-simulator-spain.vercel.app/omie_data.json.gz")
-      .catch(() => tryLoad("https://bess-simulator-spain.vercel.app/omie_data.json"))
-      .then(data => {
-        const { slots, stacks } = ingestPreloadedData(data, solveIntersection);
-        setPriceSlots(slots);
-        const nd = new Set(slots.map(s => s.date)).size;
-        setPriceStatus("2024 reference year · " + nd + " days · pre-loaded");
-        if (stacks) {
-          setCurveStacks(stacks);
-          setCurveStatus("Pre-loaded · " + Object.keys(stacks).length + " days with curves");
-        }
-        setPreloadStatus("done");
-        setTab("simulate");
-      })
-      .catch(err => {
-        console.warn("Could not load preloaded data:", err);
-        setPreloadStatus("error");
-      });
-  }, []);
 
   const handlePriceFiles = useCallback(async files => {
     const arr = Array.from(files); let all = [], fail = 0;
@@ -440,7 +510,6 @@ export default function App() {
     setPriceSlots(ded);
     const nd = new Set(ded.map(s => s.date)).size;
     setPriceStatus("OK " + ded.length + " hourly slots, " + nd + " days, " + arr.length + " file(s)" + (fail ? ", " + fail + " failed" : ""));
-    setPreloadStatus("overridden");
   }, []);
 
   const handleCurveFiles = useCallback(async files => {
@@ -491,27 +560,92 @@ export default function App() {
       const next = () => {
         if (idx >= bess.length) { setSimRes(out); setTab("results"); setRunning(false); setRunSt(""); return; }
         const sc = bess[idx++]; const mw = sc.gw * 1000;
-        setRunSt("Scoring " + sc.label + "...");
+        setRunSt(sc.label + " — scoring...");
         setTimeout(() => {
-          const scores = scoreAllHours(daily, curveStacks, rt, mw);
-          setRunSt("Dispatching " + sc.label + "...");
-          setTimeout(() => {
-            out[sc.label] = allDates.map(d => simulateDay(d, daily[d], scores, mw, bessH, rt, cycD)).filter(Boolean);
-            next();
-          }, 0);
+          // Iterative dispatch: score → dispatch → check if peak hours changed → re-score
+          const MAX_ITER = 3;
+          let scores = scoreAllHours(daily, curveStacks, rt, mw, solScale);
+          let results = null;
+
+          for (let iter = 0; iter < MAX_ITER; iter++) {
+            setRunSt(sc.label + " — iteration " + (iter + 1) + "/" + MAX_ITER);
+            results = allDates.map(d => simulateDay(d, daily[d], scores, mw, bessH, rt, cycD)).filter(Boolean);
+
+            if (iter < MAX_ITER - 1) {
+              // Check if dispatch changed peak/trough hours
+              // Re-score using adjusted prices as new "spot" to capture feedback
+              let changed = false;
+              const adjByDateHour = {};
+              results.forEach(r => {
+                r.trace.forEach(t => {
+                  if (t.act !== "idle") {
+                    adjByDateHour[r.date + "|" + t.hora] = t.adj;
+                  }
+                });
+              });
+
+              // If active hours' adjusted prices differ significantly from spot, re-score
+              const keys = Object.keys(adjByDateHour);
+              if (keys.length > 0) {
+                let totalDrift = 0;
+                keys.forEach(k => {
+                  const sc2 = scores[k];
+                  if (sc2) totalDrift += Math.abs(adjByDateHour[k] - sc2.spot);
+                });
+                const avgDrift = totalDrift / keys.length;
+                if (avgDrift > 3) { // >EUR 3 average price drift → worth re-iterating
+                  changed = true;
+                  // Re-score with adjusted prices feeding back
+                  scores = scoreAllHours(daily, curveStacks, rt, mw, solScale);
+                }
+              }
+              if (!changed) break; // converged
+            }
+          }
+
+          out[sc.label] = results;
+          setTimeout(next, 0);
         }, 0);
       };
       next();
     }, 0);
-  }, [daily, curveStacks, bessH, rt, cycD]);
+  }, [daily, curveStacks, bessH, rt, cycD, solScale]);
 
   const stats = useMemo(() => {
     if (!simRes) return [];
     return SCENARIOS.map(sc => {
       const r = simRes[sc.label] || [], n = r.length || 1;
       let sm = 0, sn = 0, ss = 0, sr = 0, scv = 0;
-      r.forEach(d => { sm += d.aMax || 0; sn += d.aMin || 0; ss += d.aSpread || 0; sr += d.rev || 0; scv += d.curvePct || 0; });
-      return { ...sc, avgMax: sm / n, avgMin: sn / n, avgSpread: ss / n, annRev: sr * (365 / n), curvePct: Math.round(scv / n) };
+      let totalDisMWh = 0, totalDisRev = 0, totalChgMWh = 0, totalChgCost = 0;
+      r.forEach(d => {
+        sm += d.aMax || 0; sn += d.aMin || 0; ss += d.aSpread || 0;
+        sr += d.rev || 0; scv += d.curvePct || 0;
+        // Compute capture price from dispatch trace
+        if (d.trace) {
+          d.trace.forEach(t => {
+            if (t.act === "discharge" && t.mw > 0) {
+              totalDisMWh += t.mw; // 1 hour
+              totalDisRev += t.mw * t.adj;
+            }
+            if (t.act === "charge" && t.mw > 0) {
+              totalChgMWh += t.mw;
+              totalChgCost += t.mw * t.adj;
+            }
+          });
+        }
+      });
+      const capturePrice = totalDisMWh > 0 ? totalDisRev / totalDisMWh : 0;
+      const chargeCost = totalChgMWh > 0 ? totalChgCost / totalChgMWh : 0;
+      const netCapture = capturePrice - chargeCost;
+      const revPerMW = sc.gw > 0 ? (sr * 365 / n) / (sc.gw * 1000) : 0; // EUR/MW/yr
+      return {
+        ...sc, avgMax: sm / n, avgMin: sn / n, avgSpread: ss / n,
+        annRev: sr * (365 / n), curvePct: Math.round(scv / n),
+        capturePrice: +capturePrice.toFixed(1),
+        chargeCost: +chargeCost.toFixed(1),
+        netCapture: +netCapture.toFixed(1),
+        revPerMW: +revPerMW.toFixed(0),
+      };
     });
   }, [simRes]);
 
@@ -549,13 +683,15 @@ export default function App() {
     if (!simRes || !daily) return null;
     const sc = SCENARIOS.find(s => s.label === stripSc) || SCENARIOS[1];
     const allDates = Object.keys(daily).sort();
-    const agg = {}; // hora → {spotSum, adjSum, actVotes, socSum, mwSum, count}
+    const agg = {}; // hora → {spotSum, adjSum, actVotes, socSum, mwSum, mktSum, count}
     for (const date of allDates) {
       const res = (simRes[sc.label] || []).find(d => d.date === date);
       if (!res?.trace) continue;
       for (const t of res.trace) {
-        if (!agg[t.hora]) agg[t.hora] = { spotS: 0, adjS: 0, votes: { charge: 0, discharge: 0, idle: 0 }, socS: 0, mwS: 0, n: 0 };
-        const a = agg[t.hora]; a.spotS += t.spot; a.adjS += t.adj; a.votes[t.act]++; a.socS += t.soc; a.mwS += t.mw; a.n++;
+        if (!agg[t.hora]) agg[t.hora] = { spotS: 0, adjS: 0, votes: { charge: 0, discharge: 0, idle: 0 }, socS: 0, mwS: 0, mktS: 0, mktN: 0, n: 0 };
+        const a = agg[t.hora]; a.spotS += t.spot; a.adjS += t.adj; a.votes[t.act]++; a.socS += t.soc; a.mwS += t.mw;
+        if (t.mktMW != null) { a.mktS += t.mktMW; a.mktN++; }
+        a.n++;
       }
     }
     const bars = Array.from({ length: 24 }, (_, i) => i + 1).map(h => {
@@ -563,7 +699,8 @@ export default function App() {
       const v = a.votes;
       const act = sc.gw === 0 ? "idle" : (v.discharge >= v.charge ? (v.discharge > v.idle ? "discharge" : "idle") : (v.charge > v.idle ? "charge" : "idle"));
       return { h: String(h), spot: +(a.spotS / a.n).toFixed(2), adj: +(a.adjS / a.n).toFixed(2),
-        act, soc: Math.round(a.socS / a.n), mw: +(a.mwS / a.n).toFixed(0) };
+        act, soc: Math.round(a.socS / a.n), mw: +(a.mwS / a.n).toFixed(0),
+        mkt: a.mktN > 0 ? +(a.mktS / a.mktN).toFixed(0) : null };
     }).filter(Boolean);
     return { label: "Avg " + allDates.length + " days · 24 hours", bars, sc };
   }, [simRes, daily, stripSc]);
@@ -593,35 +730,71 @@ export default function App() {
     return { chrono, dur };
   }, [simRes, daily]);
 
-  const base = stats[0] || {};
+  const [eqData, setEqData] = useState(null);
+  const [eqRunning, setEqRunning] = useState(false);
 
-  // ── Loading screen ────────────────────────────────────────────────────────
-  if (preloadStatus === "loading") {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center space-y-3">
-          <div className="text-4xl animate-pulse">⚡</div>
-          <div className="text-indigo-700 font-bold text-lg">BESS Market Clearing Simulator</div>
-          <div className="text-gray-500 text-sm">Loading 2024 OMIE reference data...</div>
-          <div className="w-48 h-1.5 bg-gray-200 rounded-full mx-auto overflow-hidden">
-            <div className="h-full bg-indigo-500 rounded-full animate-pulse" style={{width:"60%"}}/>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const runEquilibrium = useCallback(() => {
+    setEqRunning(true);
+    const allDates = Object.keys(daily).sort();
+    const steps = Array.from({ length: 21 }, (_, i) => i * 0.5); // 0 to 10 GW
+    const results = [];
+    let si = 0;
+
+    const nextStep = () => {
+      if (si >= steps.length) {
+        setEqData(results);
+        setEqRunning(false);
+        return;
+      }
+      const gw = steps[si++];
+      const mw = gw * 1000;
+      setTimeout(() => {
+        if (gw === 0) {
+          results.push({ gw, revPerMW: 0, totalRev: 0, capturePrice: 0, spread: 0 });
+          nextStep();
+          return;
+        }
+        const scores = scoreAllHours(daily, curveStacks, rt, mw, solScale);
+        let totalRev = 0, totalDisMWh = 0, totalDisRev = 0, spreadSum = 0, n = 0;
+        allDates.forEach(d => {
+          const sim = simulateDay(d, daily[d], scores, mw, bessH, rt, cycD);
+          if (sim) {
+            totalRev += sim.rev;
+            spreadSum += sim.aSpread;
+            n++;
+            sim.trace.forEach(t => {
+              if (t.act === "discharge" && t.mw > 0) {
+                totalDisMWh += t.mw;
+                totalDisRev += t.mw * t.adj;
+              }
+            });
+          }
+        });
+        const annRev = totalRev * (365 / Math.max(n, 1));
+        results.push({
+          gw,
+          revPerMW: mw > 0 ? Math.round(annRev / mw) : 0,
+          totalRev: +(annRev / 1e6).toFixed(1),
+          capturePrice: totalDisMWh > 0 ? +(totalDisRev / totalDisMWh).toFixed(1) : 0,
+          spread: n > 0 ? +(spreadSum / n).toFixed(1) : 0,
+        });
+        nextStep();
+      }, 0);
+    };
+    nextStep();
+  }, [daily, curveStacks, rt, bessH, cycD, solScale]);
 
   return (
     <div className="bg-gray-50 min-h-screen p-3 font-sans text-sm text-gray-800">
       <div className="max-w-5xl mx-auto">
         <h1 className="text-xl font-bold text-indigo-900 mb-0.5">BESS Market Clearing Simulator</h1>
-        <p className="text-gray-400 text-xs mb-3">OMIE · Hourly resolution · Non-linear merit order · v19</p>
+        <p className="text-gray-400 text-xs mb-3">OMIE · Hourly · Quantity-based merit order · v20</p>
 
         <div className="flex gap-1 mb-4 flex-wrap">
-          {["upload", "simulate", "results", "economics"].map(t => (
+          {["upload", "simulate", "results", "economics", "equilibrium"].map(t => (
             <button key={t} onClick={() => setTab(t)} disabled={t !== "upload" && !hasP}
               className={"px-3 py-1.5 rounded-full text-xs font-semibold transition-all " + (tab === t ? "bg-indigo-600 text-white shadow" : "bg-white text-gray-500 hover:bg-indigo-50 border") + " disabled:opacity-30"}>
-              {{ upload: "Data", simulate: "Simulate", results: "Results", economics: "P&L" }[t]}
+              {{ upload: "Data", simulate: "Simulate", results: "Results", economics: "P&L", equilibrium: "Equilibrium" }[t]}
             </button>
           ))}
         </div>
@@ -630,11 +803,6 @@ export default function App() {
         {tab === "upload" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-4">
-              {preloadStatus === "done" && (
-                <div className="bg-green-50 border border-green-200 rounded-xl p-3 text-xs text-green-700">
-                  ✅ <strong>2024 reference year pre-loaded.</strong> Upload your own files below to override.
-                </div>
-              )}
               <div onDrop={onDropP} onDragOver={e => e.preventDefault()} onClick={() => document.getElementById("fp").click()}
                 className="border-2 border-dashed border-indigo-300 rounded-xl p-8 text-center cursor-pointer hover:bg-indigo-50 bg-white">
                 <div className="text-3xl mb-2">📈</div>
@@ -655,9 +823,9 @@ export default function App() {
             <div className="bg-white border rounded-xl p-4 space-y-3">
               <div className="font-semibold text-gray-700 text-xs uppercase">How it works</div>
               <div className="text-xs text-gray-500 space-y-2">
-                <p>1. <strong>2024 OMIE data is pre-loaded</strong> — jump straight to Simulate</p>
-                <p>2. Or upload your own files to use a different year</p>
-                <p>3. The simulator models BESS fleets of 1-10 GW bidding into the Spanish day-ahead market</p>
+                <p>1. Load marginal price files (hourly OMIE day-ahead prices)</p>
+                <p>2. Optionally load curva_pbc files for real supply/demand curves</p>
+                <p>3. The simulator computes what happens when BESS fleets of 1-10 GW bid into the market</p>
                 <p>4. Discharge adds supply → suppresses peak prices (non-linearly along the merit order)</p>
                 <p>5. Charge adds demand → lifts trough prices (mostly during solar hours)</p>
               </div>
@@ -681,6 +849,14 @@ export default function App() {
                 <Slider label="Round-trip eff." value={rt} min={0.75} max={0.97} step={0.01} unit="" onChange={setRt} />
                 <Slider label="Cycles/day" value={cycD} min={1} max={4} step={1} unit="" onChange={setCycD} />
                 <div className="text-xs text-gray-400 mt-1">= {cycD * bessH}h charge + {cycD * bessH}h discharge / day</div>
+              </div>
+              <div className="bg-white border rounded-xl p-4">
+                <div className="text-xs font-bold text-indigo-800 uppercase mb-3">Scenarios</div>
+                <Slider label="Solar capacity" value={solScale} min={0.5} max={3.0} step={0.1} unit="×" onChange={setSolScale} />
+                <div className="text-xs text-gray-400 mt-1">
+                  {solScale === 1 ? "Current (2025)" : solScale < 1 ? "Reduced solar" : "+" + Math.round((solScale - 1) * 100) + "% solar expansion"}
+                  {solScale >= 1.5 && " — deeper midday troughs, faster cannibalisation"}
+                </div>
               </div>
             </div>
             <div className="md:col-span-2 space-y-3">
@@ -721,7 +897,9 @@ export default function App() {
                   <div className="font-bold">EUR{fmt(sc.avgMin, 1)}</div>
                   <div className="text-xs text-gray-400 mt-1">Avg spread</div>
                   <div className="font-bold" style={{ color: sc.color }}>EUR{fmt(sc.avgSpread, 1)}</div>
-                  {sc.gw > 0 && <div className="text-xs text-gray-300 mt-1">{sc.curvePct}% curve</div>}
+                  {sc.gw > 0 && <div className="text-xs text-gray-400 mt-1">Capture</div>}
+                  {sc.gw > 0 && <div className="font-bold text-xs">EUR{fmt(sc.capturePrice, 1)}/MWh</div>}
+                  {sc.gw > 0 && <div className="text-xs text-gray-300 mt-0.5">{sc.curvePct}% curve</div>}
                 </div>
               ))}
             </div>
@@ -827,66 +1005,43 @@ export default function App() {
                 const dischargePct = totalVotes > 0 ? Math.round(100 * actVotes.discharge / totalVotes) : 0;
                 const idlePct = totalVotes > 0 ? Math.round(100 * actVotes.idle / totalVotes) : 100;
 
-                // Average spot price at this hour
-                const avgSpot = allDates.reduce((s, d) => {
-                  const sl = (daily[d] || []).find(x => x.hora === curveHour);
-                  return sl ? { sum: s.sum + sl.price, n: s.n + 1 } : s;
-                }, { sum: 0, n: 0 });
-                const spotPrice = avgSpot.n > 0 ? avgSpot.sum / avgSpot.n : 40;
+                // Build supply curve from proxy model
+                const proxyCurve = buildProxyCurve(curveHour, spotPrice);
+                const clearGW = findClearingGW(proxyCurve, spotPrice);
 
-                // Build synthetic supply curve
-                const tgGW = THERMAL_GAP[curveHour] || 10;
-                const damGW = tgGW * 0.56;
-                const totalSupplyGW = damGW + 18;
+                // Convert proxy curve to MW for chart (consistent with curva_pbc scale)
+                const supPts = proxyCurve.map(p => ({ mw: Math.round(p.gw * 1000), price: +p.price.toFixed(1) }));
+                const supEnd = supPts.at(-1).mw;
 
-                const supPts = [];
-                for (let mw = 0; mw <= 7000; mw += 500) supPts.push({ mw, price: 1 + mw * 0.0003 });
-                const reGW = Math.max(totalSupplyGW - damGW - 7, 0);
-                for (let mw = 7000; mw <= 7000 + reGW * 1000; mw += 500) supPts.push({ mw, price: 0 + (mw - 7000) * 0.001 });
-                const reEnd = 7000 + reGW * 1000;
-                for (let mw = reEnd; mw <= reEnd + 3000; mw += 300) supPts.push({ mw, price: 10 + (mw - reEnd) * 0.008 });
-                const hyEnd = reEnd + 3000;
-                const gasGW = Math.max(damGW - 3, 1);
-                for (let mw = hyEnd; mw <= hyEnd + gasGW * 1000; mw += 200) {
-                  const frac = (mw - hyEnd) / (gasGW * 1000);
-                  supPts.push({ mw, price: 35 + frac * frac * (spotPrice * 1.3 - 35) });
-                }
-                const gasEnd = hyEnd + gasGW * 1000;
-                for (let mw = gasEnd; mw <= gasEnd + 2000; mw += 200) {
-                  supPts.push({ mw, price: spotPrice * 1.1 + (mw - gasEnd) * 0.05 });
-                }
-                const supEnd = gasEnd + 2000;
-
-                // Demand curve
+                // Demand curve: typical inelastic
+                const clearMW = Math.round(clearGW * 1000);
                 const demPts = [];
-                const clearMW = gasEnd - 500;
-                for (let mw = 0; mw <= supEnd; mw += 300) {
+                for (let mw = 0; mw <= supEnd + bessMW + 2000; mw += 300) {
                   const price = mw < clearMW * 0.8 ? 180 - mw * 0.002
                     : mw < clearMW * 1.2 ? spotPrice + (clearMW - mw) * 0.04
-                    : Math.max(0, spotPrice - (mw - clearMW) * 0.08);
-                  demPts.push({ mw, price: Math.max(price, -10) });
+                    : Math.max(-10, spotPrice - (mw - clearMW) * 0.08);
+                  demPts.push({ mw, price: +Math.max(price, -10).toFixed(1) });
                 }
 
-                // Only shift the curve that's actually affected
-                const showDischarge = dominantAct === "discharge";
-                const showCharge = dominantAct === "charge";
+                // Shifted curves for visualisation
                 const supShifted = supPts.map(p => ({ mw: p.mw + bessMW, price: p.price }));
                 const demShifted = demPts.map(p => ({ mw: p.mw + bessMW, price: p.price }));
 
-                const findClear = (sup, dem) => {
-                  for (let i = 0; i < sup.length; i++) {
-                    const s = sup[i];
-                    const dPt = dem.find(d => d.mw >= s.mw);
-                    if (dPt && s.price >= dPt.price) return { mw: s.mw, price: s.price };
-                  }
-                  return { mw: clearMW, price: spotPrice };
-                };
+                // Find clearing prices using the quantity-based model
+                const baseClearPrice = spotPrice;
+                const disClearPrice = proxyPrice(spotPrice, bessMW, "discharge", curveHour);
+                const chgClearPrice = proxyPrice(spotPrice, bessMW, "charge", curveHour);
 
-                const baseClear = findClear(supPts, demPts);
-                const disClear = findClear(supShifted, demPts);
-                const chgClear = findClear(supPts, demShifted);
+                const baseClear = { mw: clearMW, price: baseClearPrice };
+                const disClear = { mw: clearMW + bessMW, price: disClearPrice };
+                const chgClear = { mw: clearMW + bessMW, price: chgClearPrice };
 
-                const yMax = Math.min(Math.max(spotPrice * 2, 100), 200);
+                const tgGW = THERMAL_GAP[curveHour] || 10;
+                const damGW = tgGW * 0.56;
+
+                const showDischarge = dominantAct === "discharge";
+                const showCharge = dominantAct === "charge";
+                const yMax = Math.min(Math.max(spotPrice * 2.5, 100), 200);
                 const xMax = supEnd + bessMW + 2000;
                 const clipY = p => Math.max(-10, Math.min(yMax, p));
 
@@ -899,7 +1054,7 @@ export default function App() {
                   const votes = { charge: 0, discharge: 0, idle: 0, total: 0 };
                   if (sc.gw > 0 && simRes?.[sc.label]) {
                     simRes[sc.label].forEach(r => {
-                      const t = r.trace?.find(t => t.hora === parseInt(h));
+                      const t = r.trace?.find(t => t.hora === h);
                       if (t) { votes[t.act]++; votes.total++; }
                     });
                   }
@@ -1190,7 +1345,7 @@ export default function App() {
                           <Tooltip formatter={(v, n) => [v + " GW", n]} contentStyle={{ fontSize: 11 }} />
                           <Legend wrapperStyle={{ fontSize: 10 }} />
                           <Bar dataKey="residual" name="Thermal gap (base)" fill="#fca5a5" radius={[2, 2, 0, 0]} isAnimationActive={false} />
-                          {SCENARIOS.filter(s => s.gw > 0).forEach(sc => (
+                          {SCENARIOS.filter(s => s.gw > 0).map(sc => (
                             <Line key={sc.label} type="monotone" dataKey={sc.label} name={"With " + sc.label}
                               stroke={sc.color} strokeWidth={1.5} strokeDasharray="4 2" dot={false} />
                           ))}
@@ -1307,7 +1462,7 @@ export default function App() {
                         <LineChart data={monthlyData} margin={{ top: 4, right: 10, left: 0, bottom: 4 }}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                           <XAxis dataKey="month" tick={{ fontSize: 10 }} /><YAxis tick={{ fontSize: 10 }} unit={isSpr ? "€" : "M"} />
-                          <Tooltip formatter={(v, n) => [isSpr ? "EUR" + fmt(v, 1) : "EUR" + fmt(v, 1) + "M", n]} /><Legend wrapperStyle={{ fontSize: 10 }} />
+                          <Tooltip formatter={(v, n) => [isSpr ? "EUR" + fmt(v, 1) : "EUR" + fmt(v, 2) + "M", n]} /><Legend wrapperStyle={{ fontSize: 10 }} />
                           {(isSpr ? SCENARIOS : SCENARIOS.filter(s => s.gw > 0)).map(sc => (
                             <Line key={sc.label} type="monotone" dataKey={mk + "_" + sc.label} name={sc.label} stroke={sc.color} strokeWidth={sc.gw === 0 ? 1.5 : 2.5} strokeDasharray={sc.gw === 0 ? "4 2" : undefined} dot={false} />
                           ))}
@@ -1331,30 +1486,63 @@ export default function App() {
 
               {/* SUMMARY */}
               {resultTab === "summary" && (
-                <table className="w-full text-xs">
-                  <thead><tr className="text-gray-400 border-b">
-                    {["Scenario", "GW", "Avg max", "Δ", "Avg min", "Δ", "Spread", "Δ", "Annual rev"].map(h => (
-                      <th key={h} className="pb-1 text-left pr-3 font-medium">{h}</th>))}</tr></thead>
-                  <tbody>
-                    {stats.map((sc, i) => (
-                      <tr key={sc.label} className="border-b hover:bg-gray-50">
-                        <td className="py-1.5 font-bold pr-3" style={{ color: sc.color }}>{sc.label}</td>
-                        <td className="pr-3">{sc.gw}</td>
-                        <td className="font-mono pr-3">EUR{fmt(sc.avgMax, 1)}</td>
-                        <td className={"pr-3 " + (i > 0 ? (sc.avgMax < base.avgMax ? "text-green-600" : "text-red-400") : "text-gray-300")}>
-                          {i === 0 ? "--" : fmt((sc.avgMax - base.avgMax) / base.avgMax * 100, 1) + "%"}</td>
-                        <td className="font-mono pr-3">EUR{fmt(sc.avgMin, 1)}</td>
-                        <td className={"pr-3 " + (i > 0 ? (sc.avgMin > base.avgMin ? "text-amber-500" : "text-green-600") : "text-gray-300")}>
-                          {i === 0 ? "--" : (sc.avgMin >= base.avgMin ? "+" : "") + fmt((sc.avgMin - base.avgMin) / Math.max(Math.abs(base.avgMin), 0.01) * 100, 1) + "%"}</td>
-                        <td className="font-mono font-bold pr-3" style={{ color: sc.color }}>EUR{fmt(sc.avgSpread, 1)}</td>
-                        <td className={"pr-3 " + (i > 0 ? (sc.avgSpread < base.avgSpread ? "text-red-500" : "text-green-600") : "text-gray-300")}>
-                          {i === 0 ? "--" : fmt((sc.avgSpread - base.avgSpread) / base.avgSpread * 100, 1) + "%"}</td>
-                        <td className={"font-mono " + (sc.annRev > 0 ? "text-green-700" : "text-red-500")}>
-                          {sc.gw === 0 ? "--" : fmtE(sc.annRev)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <div className="space-y-4">
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-gray-400 border-b">
+                      {["Scenario", "GW", "Avg max", "Δ", "Avg min", "Δ", "Spread", "Δ", "Annual rev"].map(h => (
+                        <th key={h} className="pb-1 text-left pr-3 font-medium">{h}</th>))}
+                    </tr></thead>
+                    <tbody>
+                      {stats.map((sc, i) => (
+                        <tr key={sc.label} className="border-b hover:bg-gray-50">
+                          <td className="py-1.5 font-bold pr-3" style={{ color: sc.color }}>{sc.label}</td>
+                          <td className="pr-3">{sc.gw}</td>
+                          <td className="font-mono pr-3">EUR{fmt(sc.avgMax, 1)}</td>
+                          <td className={"pr-3 " + (i > 0 ? (sc.avgMax < base.avgMax ? "text-green-600" : "text-red-400") : "text-gray-300")}>
+                            {i === 0 ? "--" : fmt((sc.avgMax - base.avgMax) / base.avgMax * 100, 1) + "%"}</td>
+                          <td className="font-mono pr-3">EUR{fmt(sc.avgMin, 1)}</td>
+                          <td className={"pr-3 " + (i > 0 ? (sc.avgMin > base.avgMin ? "text-amber-500" : "text-green-600") : "text-gray-300")}>
+                            {i === 0 ? "--" : (sc.avgMin >= base.avgMin ? "+" : "") + fmt((sc.avgMin - base.avgMin) / Math.max(Math.abs(base.avgMin), 0.01) * 100, 1) + "%"}</td>
+                          <td className="font-mono font-bold pr-3" style={{ color: sc.color }}>EUR{fmt(sc.avgSpread, 1)}</td>
+                          <td className={"pr-3 " + (i > 0 ? (sc.avgSpread < base.avgSpread ? "text-red-500" : "text-green-600") : "text-gray-300")}>
+                            {i === 0 ? "--" : fmt((sc.avgSpread - base.avgSpread) / base.avgSpread * 100, 1) + "%"}</td>
+                          <td className={"font-mono " + (sc.annRev > 0 ? "text-green-700" : "text-gray-400")}>
+                            {sc.gw === 0 ? "--" : fmtE(sc.annRev)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {/* Capture price table */}
+                  <div className="text-sm font-bold text-gray-800 mt-2 mb-1">Capture Price & Cannibalization</div>
+                  <div className="text-xs text-gray-500 mb-2">
+                    Capture price = avg EUR/MWh earned when discharging. As BESS penetration grows, capture price erodes — the cannibalization effect.
+                  </div>
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-gray-400 border-b">
+                      {["Scenario", "Capture price", "Charge cost", "Net capture", "Rev/MW/yr", "Capture Δ vs 1GW"].map(h => (
+                        <th key={h} className="pb-1 text-left pr-4 font-medium">{h}</th>))}
+                    </tr></thead>
+                    <tbody>
+                      {stats.filter(sc => sc.gw > 0).map((sc, i) => {
+                        const ref = stats.find(s => s.gw === 1);
+                        const capDelta = ref && ref.capturePrice > 0 ? ((sc.capturePrice - ref.capturePrice) / ref.capturePrice * 100) : 0;
+                        return (
+                          <tr key={sc.label} className="border-b hover:bg-gray-50">
+                            <td className="py-1.5 font-bold pr-4" style={{ color: sc.color }}>{sc.label}</td>
+                            <td className="font-mono pr-4 font-bold">EUR{fmt(sc.capturePrice, 1)}/MWh</td>
+                            <td className="font-mono pr-4 text-red-500">EUR{fmt(sc.chargeCost, 1)}/MWh</td>
+                            <td className={"font-mono pr-4 font-bold " + (sc.netCapture > 0 ? "text-green-700" : "text-red-500")}>
+                              EUR{fmt(sc.netCapture, 1)}/MWh</td>
+                            <td className="font-mono pr-4">EUR{fmt(sc.revPerMW, 0)}/MW</td>
+                            <td className={"font-mono pr-4 " + (capDelta < -10 ? "text-red-500" : capDelta < 0 ? "text-amber-500" : "text-gray-400")}>
+                              {i === 0 ? "ref" : fmt(capDelta, 0) + "%"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </div>
           </div>
@@ -1368,25 +1556,63 @@ export default function App() {
                 <div className="text-xs font-bold text-indigo-800 uppercase mb-3">Costs</div>
                 <Slider label="CAPEX" value={capex} min={100} max={900} step={10} unit="€/kWh" onChange={setCapex} />
                 <Slider label="OPEX" value={opex} min={1} max={25} step={1} unit="€/kWh/yr" onChange={setOpex} />
+                <div className="text-xs font-bold text-indigo-800 uppercase mb-3 mt-4">Additional Revenue</div>
+                <Slider label="Ancillary (at 1GW)" value={ancillaryBase} min={0} max={120} step={5} unit="€/kW/yr" onChange={setAncillaryBase} />
+                <Slider label="Capacity market" value={capacityPrice} min={0} max={100} step={5} unit="€/kW/yr" onChange={setCapacityPrice} />
+                <label className="text-xs text-gray-500 flex items-center gap-1.5 cursor-pointer mt-1 mb-3">
+                  <input type="checkbox" checked={ancillaryCannibal} onChange={e => setAncillaryCannibal(e.target.checked)} />
+                  Ancillary cannibalisation
+                </label>
+                <div className="text-xs font-bold text-indigo-800 uppercase mb-3">Project</div>
+                <Slider label="Project life" value={life} min={5} max={25} step={1} unit="yrs" onChange={setLife} />
               </div>
               <div className="md:col-span-3 space-y-3">
+                {/* Ancillary cannibalisation preview */}
+                {ancillaryCannibal && ancillaryBase > 0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800">
+                    <span className="font-bold">Ancillary cannibalisation active: </span>
+                    {SCENARIOS.filter(s => s.gw > 0).map(sc => {
+                      const aRev = ancillaryPerKW(ancillaryBase, sc.gw);
+                      return <span key={sc.label} className="mr-3" style={{ color: sc.color }}>{sc.label}: €{fmt(aRev, 0)}/kW</span>;
+                    })}
+                  </div>
+                )}
+
                 <table className="w-full text-xs bg-white border rounded-xl overflow-hidden">
                   <thead><tr className="bg-gray-50 border-b">
-                    {["Scenario", "Capacity", "CAPEX", "OPEX/yr", "Revenue/yr", "EBITDA", "Payback"].map(h => (
-                      <th key={h} className="p-2 text-left font-semibold text-gray-500">{h}</th>))}</tr></thead>
+                    {["Scenario", "MW / MWh", "CAPEX", "OPEX/yr", "Arbitrage", "Ancillary", "Capacity", "Total rev", "EBITDA", "IRR", "Payback"].map(h => (
+                      <th key={h} className="p-2 text-left font-semibold text-gray-500" style={{ fontSize: 10 }}>{h}</th>))}
+                  </tr></thead>
                   <tbody>
                     {stats.filter(sc => sc.gw > 0).map(sc => {
-                      const kWh = sc.gw * 1000 * bessH * 1000;
-                      const cx = capex * kWh, ox = opex * kWh;
-                      const eb = sc.annRev - ox, pb = eb > 0 ? cx / eb : Infinity;
+                      const powerKW = sc.gw * 1000 * 1000;
+                      const energyKWh = powerKW * bessH;
+                      const cx = capex * energyKWh;
+                      const ox = opex * energyKWh;
+                      const arbRev = sc.annRev;
+                      const ancRate = ancillaryCannibal ? ancillaryPerKW(ancillaryBase, sc.gw) : ancillaryBase;
+                      const ancRev = ancRate * powerKW;
+                      const capRev = capacityPrice * powerKW;
+                      const totalRev = arbRev + ancRev + capRev;
+                      const eb = totalRev - ox;
+                      const pb = eb > 0 ? cx / eb : Infinity;
+                      const cashflows = [-cx];
+                      for (let y = 1; y <= life; y++) cashflows.push(eb);
+                      const irr = calcIRR(cashflows);
+
                       return (
                         <tr key={sc.label} className="border-b hover:bg-gray-50">
                           <td className="p-2 font-bold" style={{ color: sc.color }}>{sc.label}</td>
-                          <td className="p-2">{fmt(sc.gw * bessH * 1000)} MWh</td>
+                          <td className="p-2 text-gray-500">{fmt(sc.gw * 1000)} / {fmt(sc.gw * bessH * 1000)}</td>
                           <td className="p-2">{fmtE(cx)}</td>
                           <td className="p-2">{fmtE(ox)}</td>
-                          <td className={"p-2 font-bold " + (sc.annRev >= 0 ? "text-green-700" : "text-red-500")}>{fmtE(sc.annRev)}</td>
+                          <td className={"p-2 " + (arbRev >= 0 ? "text-green-700" : "text-red-500")}>{fmtE(arbRev)}</td>
+                          <td className="p-2 text-blue-600">{fmtE(ancRev)}</td>
+                          <td className="p-2 text-purple-600">{fmtE(capRev)}</td>
+                          <td className="p-2 font-bold">{fmtE(totalRev)}</td>
                           <td className={"p-2 font-bold " + (eb >= 0 ? "text-blue-700" : "text-red-500")}>{fmtE(eb)}</td>
+                          <td className={"p-2 font-bold " + (isFinite(irr) && irr > 0.08 ? "text-green-700" : isFinite(irr) && irr > 0 ? "text-amber-600" : "text-red-500")}>
+                            {isFinite(irr) ? (irr * 100).toFixed(1) + "%" : "--"}</td>
                           <td className={"p-2 font-bold " + (!isFinite(pb) ? "text-red-500" : pb < 10 ? "text-indigo-700" : "text-orange-500")}>
                             {!isFinite(pb) ? "∞" : fmt(pb, 1) + " yrs"}</td>
                         </tr>
@@ -1394,19 +1620,58 @@ export default function App() {
                     })}
                   </tbody>
                 </table>
+
+                {/* Revenue waterfall chart */}
                 <div className="bg-white border rounded-xl p-3">
-                  <div className="text-xs text-gray-400 mb-2">Annual Revenue vs EBITDA (M EUR)</div>
-                  <ResponsiveContainer width="100%" height={180}>
+                  <div className="text-xs text-gray-400 mb-2">Annual Revenue Breakdown (M EUR)</div>
+                  <ResponsiveContainer width="100%" height={200}>
                     <BarChart data={stats.filter(sc => sc.gw > 0).map(sc => {
-                      const kWh = sc.gw * 1000 * bessH * 1000;
-                      return { label: sc.label, rev: +(sc.annRev / 1e6).toFixed(1), ebitda: +((sc.annRev - opex * kWh) / 1e6).toFixed(1) };
+                      const powerKW = sc.gw * 1000 * 1000;
+                      const ancRate = ancillaryCannibal ? ancillaryPerKW(ancillaryBase, sc.gw) : ancillaryBase;
+                      return {
+                        label: sc.label,
+                        arb: +(sc.annRev / 1e6).toFixed(1),
+                        anc: +(ancRate * powerKW / 1e6).toFixed(1),
+                        cap: +(capacityPrice * powerKW / 1e6).toFixed(1),
+                      };
                     })} margin={{ top: 4, right: 8, left: 8, bottom: 4 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis dataKey="label" tick={{ fontSize: 10 }} /><YAxis tick={{ fontSize: 10 }} unit="M" domain={["auto", "auto"]} />
-                      <ReferenceLine y={0} stroke="#94a3b8" strokeWidth={1} />
-                      <Tooltip formatter={(v, n) => ["EUR" + fmt(v, 1) + "M", n]} /><Legend wrapperStyle={{ fontSize: 10 }} />
-                      <Bar dataKey="rev" name="Revenue" fill="#6366f1" radius={[3, 3, 0, 0]} />
-                      <Bar dataKey="ebitda" name="EBITDA" fill="#10b981" radius={[3, 3, 0, 0]} />
+                      <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+                      <YAxis tick={{ fontSize: 10 }} unit="M" />
+                      <Tooltip formatter={(v, n) => ["EUR" + fmt(v, 1) + "M", n]} />
+                      <Legend wrapperStyle={{ fontSize: 10 }} />
+                      <Bar dataKey="arb" name="Arbitrage" stackId="r" fill="#6366f1" radius={[0, 0, 0, 0]} />
+                      <Bar dataKey="anc" name="Ancillary" stackId="r" fill="#3b82f6" radius={[0, 0, 0, 0]} />
+                      <Bar dataKey="cap" name="Capacity" stackId="r" fill="#a78bfa" radius={[3, 3, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* IRR sensitivity chart */}
+                <div className="bg-white border rounded-xl p-3">
+                  <div className="text-xs text-gray-400 mb-2">IRR by Scenario</div>
+                  <ResponsiveContainer width="100%" height={160}>
+                    <BarChart data={stats.filter(sc => sc.gw > 0).map(sc => {
+                      const powerKW = sc.gw * 1000 * 1000;
+                      const energyKWh = powerKW * bessH;
+                      const cx = capex * energyKWh;
+                      const ox = opex * energyKWh;
+                      const ancRate = ancillaryCannibal ? ancillaryPerKW(ancillaryBase, sc.gw) : ancillaryBase;
+                      const eb = sc.annRev + ancRate * powerKW + capacityPrice * powerKW - ox;
+                      const cf = [-cx]; for (let y = 1; y <= life; y++) cf.push(eb);
+                      const irr = calcIRR(cf);
+                      return { label: sc.label, color: sc.color, irr: isFinite(irr) ? +(irr * 100).toFixed(1) : 0 };
+                    })} margin={{ top: 4, right: 8, left: 8, bottom: 4 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+                      <YAxis tick={{ fontSize: 10 }} unit="%" domain={[0, "auto"]} />
+                      <Tooltip formatter={(v) => [v + "%", "IRR"]} />
+                      <ReferenceLine y={8} stroke="#10b981" strokeDasharray="4 2" label={{ value: "8% target", fill: "#10b981", fontSize: 9 }} />
+                      <Bar dataKey="irr" name="IRR" radius={[4, 4, 0, 0]}>
+                        {stats.filter(sc => sc.gw > 0).map((sc, i) => (
+                          <Cell key={i} fill={sc.color} />
+                        ))}
+                      </Bar>
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
@@ -1415,7 +1680,110 @@ export default function App() {
           </div>
         )}
 
-        <div className="mt-3 text-xs text-gray-300 text-center">BESS Simulator v19 · OMIE · Hourly resolution · Non-linear merit order · Daily dispatch</div>
+        {/* ═══ EQUILIBRIUM ═══ */}
+        {tab === "equilibrium" && (
+          <div className="space-y-4">
+            <div className="bg-white border rounded-xl p-4">
+              <div className="text-sm font-bold text-gray-800 mb-1">BESS Market Equilibrium Finder</div>
+              <div className="text-xs text-gray-500 mb-3">
+                Simulates BESS fleets from 0 to 10 GW in 0.5 GW steps. At each level, computes revenue per MW
+                to find where arbitrage collapses — the maximum BESS capacity the market can support.
+              </div>
+              <div className="flex gap-3 items-center mb-3">
+                <div className="text-xs text-gray-600">
+                  Solar: <b>{solScale}×</b> · Duration: <b>{bessH}h</b> · Cycles: <b>{cycD}/day</b> · RT: <b>{(rt * 100).toFixed(0)}%</b>
+                </div>
+                <button onClick={runEquilibrium} disabled={eqRunning || !hasP}
+                  className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded-lg px-4 py-2 text-xs font-bold">
+                  {eqRunning ? "Running 21 scenarios..." : "Find equilibrium"}
+                </button>
+              </div>
+              {eqPoint && (
+                <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 text-xs">
+                  <span className="font-bold text-indigo-800">Estimated equilibrium: ~{eqPoint} GW</span>
+                  <span className="text-indigo-600 ml-2">
+                    (revenue/MW drops below EUR 5,000/MW/yr — threshold for economic viability)
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {eqData && (
+              <div className="space-y-4">
+                {/* Revenue per MW curve */}
+                <div className="bg-white border rounded-xl p-4">
+                  <div className="text-xs font-semibold text-gray-700 mb-1">Revenue per MW vs BESS Penetration</div>
+                  <div className="text-xs text-gray-400 mb-2">The equilibrium point is where this curve approaches zero</div>
+                  <ResponsiveContainer width="100%" height={240}>
+                    <ComposedChart data={eqData.filter(d => d.gw > 0)} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis dataKey="gw" tick={{ fontSize: 10 }} unit=" GW" />
+                      <YAxis tick={{ fontSize: 10 }} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(0) + "k" : v} unit=" €/MW" />
+                      <Tooltip formatter={(v, n) => ["EUR" + Number(v).toLocaleString() + "/MW/yr", n]} contentStyle={{ fontSize: 11 }} />
+                      <ReferenceLine y={5000} stroke="#ef4444" strokeDasharray="4 2" strokeWidth={1} label={{ value: "Viability threshold", fill: "#ef4444", fontSize: 9 }} />
+                      <Area type="monotone" dataKey="revPerMW" name="Rev/MW/yr" fill="#6366f140" stroke="#6366f1" strokeWidth={2.5} dot={{ r: 3, fill: "#6366f1" }} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Capture price erosion */}
+                <div className="bg-white border rounded-xl p-4">
+                  <div className="text-xs font-semibold text-gray-700 mb-1">Capture Price Erosion</div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <LineChart data={eqData.filter(d => d.gw > 0)} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis dataKey="gw" tick={{ fontSize: 10 }} unit=" GW" />
+                      <YAxis tick={{ fontSize: 10 }} unit=" €" />
+                      <Tooltip formatter={(v, n) => ["EUR" + v, n]} contentStyle={{ fontSize: 11 }} />
+                      <Legend wrapperStyle={{ fontSize: 10 }} />
+                      <Line type="monotone" dataKey="capturePrice" name="Capture price (€/MWh)" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} />
+                      <Line type="monotone" dataKey="spread" name="Avg spread (€/MWh)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 2 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Total revenue curve */}
+                <div className="bg-white border rounded-xl p-4">
+                  <div className="text-xs font-semibold text-gray-700 mb-1">Total Annual Revenue vs Penetration</div>
+                  <div className="text-xs text-gray-400 mb-2">Revenue peaks then declines as cannibalisation exceeds capacity gains</div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <ComposedChart data={eqData.filter(d => d.gw > 0)} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                      <XAxis dataKey="gw" tick={{ fontSize: 10 }} unit=" GW" />
+                      <YAxis tick={{ fontSize: 10 }} unit=" M€" />
+                      <Tooltip formatter={(v, n) => ["EUR" + v + "M/yr", n]} contentStyle={{ fontSize: 11 }} />
+                      <Bar dataKey="totalRev" name="Annual revenue" fill="#10b981" radius={[3, 3, 0, 0]} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Data table */}
+                <div className="bg-white border rounded-xl p-4">
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-gray-400 border-b">
+                      {["GW", "Rev/MW/yr", "Total rev", "Capture", "Spread"].map(h => (
+                        <th key={h} className="pb-1 text-left pr-4 font-medium">{h}</th>
+                      ))}
+                    </tr></thead>
+                    <tbody>
+                      {eqData.filter(d => d.gw > 0).map(d => (
+                        <tr key={d.gw} className={"border-b hover:bg-gray-50 " + (d.revPerMW < 5000 ? "text-red-400" : "")}>
+                          <td className="py-1 font-bold pr-4">{d.gw} GW</td>
+                          <td className="font-mono pr-4">EUR{Number(d.revPerMW).toLocaleString()}</td>
+                          <td className="font-mono pr-4">EUR{d.totalRev}M</td>
+                          <td className="font-mono pr-4">EUR{d.capturePrice}</td>
+                          <td className="font-mono pr-4">EUR{d.spread}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="mt-3 text-xs text-gray-300 text-center">BESS Simulator v20 · OMIE · Quantity-based merit order · Capture price · Interconnectors</div>
       </div>
     </div>
   );

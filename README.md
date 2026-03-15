@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # OMIE Data Parser
 
 This project parses OMIE (Spanish electricity market) data files to generate a JSON file suitable for upload to Vercel for a simulator.
@@ -29,3 +30,6 @@ The JSON contains:
 - `curves`: Supply and demand curves for each hour of each day, thinned to max 50 points.
 
 Upload `omie_data.json` to Vercel for your simulator.
+=======
+# BESS_Simulator_VS
+>>>>>>> 8196700bf1858a21b0ddb4d4a976deb4093ad055
