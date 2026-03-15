@@ -1,35 +1,16 @@
-<<<<<<< HEAD
-# OMIE Data Parser
+# React + Vite
 
-This project parses OMIE (Spanish electricity market) data files to generate a JSON file suitable for upload to Vercel for a simulator.
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Prerequisites
+Currently, two official plugins are available:
 
-- Node.js installed (download from https://nodejs.org/)
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-## Data Files
+## React Compiler
 
-- Place `marginalpdbc_YYYYMMDD.1` files in `c:\Users\PabloBorras\Downloads\Omie2025`
-- Place `curva_pbc_YYYYMMDD.1` files in `c:\Users\PabloBorras\Downloads\OmieDemand2025`
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-## Usage
+## Expanding the ESLint configuration
 
-Run the script:
-
-```bash
-node parse.js
-```
-
-This will generate `omie_data.json` with the parsed data.
-
-## Output Format
-
-The JSON contains:
-
-- `prices`: Hourly average prices for each day.
-- `curves`: Supply and demand curves for each hour of each day, thinned to max 50 points.
-
-Upload `omie_data.json` to Vercel for your simulator.
-=======
-# BESS_Simulator_VS
->>>>>>> 8196700bf1858a21b0ddb4d4a976deb4093ad055
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
